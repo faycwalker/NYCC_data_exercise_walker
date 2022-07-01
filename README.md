@@ -1,3 +1,3 @@
-# Fay Walker - NYCC Data Exercise
+# Fay Walker 
 
-[Full Assignment](https://faycwalker.github.io/NYCC_data_exercise_walker/arrest_takehome.html)
+[Full Assignment](https://faycwalker.github.io/NYCC_walker/arrest_takehome.html)
