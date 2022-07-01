@@ -1,0 +1,523 @@
+---
+title: "NYC Council Data Scientist Exercise"
+author: "Fay Walker"
+date: "7/1/2022"
+output: 
+  github_document:
+    number_sections: no
+    toc: true
+    toc_depth: 3
+---
+
+```{r setup, include=FALSE, cache=T}
+knitr::opts_chunk$set(echo = TRUE,results=TRUE, message = FALSE, warning=FALSE,fig.align="center", cache=TRUE, results='hide')
+```
+
+```{r full code, tidy=T,message=F,warning=F, echo=F, cache=T, include=F}
+#load in libraries
+library(tidyverse)
+library(tidylog)
+library(tidycensus)
+library(RSocrata)
+library(sf)
+library(urbnthemes)
+library(ggplot2)
+library(patchwork)
+library(stargazer)
+library(scales)
+library(gt)
+library(gganimate)
+library(transformr)
+library(gifski)
+
+#### Load in data ####
+#2022 YTD data
+arrests_2022 <- read.socrata('https://data.cityofnewyork.us/resource/uip8-fykc.json')
+
+#historic from 2018 onwards
+arrests_hist <- read.socrata('https://data.cityofnewyork.us/resource/8h9b-rp9u.json?$where=arrest_date%3E%272017-12-31%27')
+
+#clean 2022 to only include vars of interest
+arrests_2022_clean <- arrests_2022 %>%
+  select(arrest_key, arrest_date, pd_desc,
+         ofns_desc, law_code,law_cat_cd,
+         arrest_boro, arrest_precinct,
+         age_group, perp_sex, perp_race,
+         latitude, longitude
+  )
+
+#clean 2022 and historic data together
+arrests_join <- arrests_hist %>%
+  #clean historic vars to match 2022 clean vars
+  select(arrest_key, arrest_date, pd_desc,
+         ofns_desc, law_code,law_cat_cd,
+         arrest_boro, arrest_precinct,
+         age_group, perp_sex, perp_race,
+         latitude, longitude
+  ) %>%
+  #tack on 2022 clean with matching columns
+  rbind(arrests_2022_clean) %>%
+  #create year column
+  mutate(year=as.numeric(substring(arrest_date, 1,4)))
+
+#####Group arrests by year
+arrests_annual <- arrests_join %>%
+  count(year)
+
+#Calculate arrests Jan 1-June 27, 2021
+YTD_2021 <- arrests_join %>%
+  filter(arrest_date>="2021-01-01" & arrest_date<="2021-06-27")
+
+#GLM - regression/R2 tests - format for table
+arrests_annual_format <- arrests_annual %>%
+  mutate(Arrest.Count=n,
+         Year=year) %>%
+  select(Year, Arrest.Count)
+annual_regression <-lm(Arrest.Count~Year, data = arrests_annual_format) 
+#stargazer(annual_regression, type = "html",  
+#          title = "Year over Year Arrests")
+#export html markdown to markdown
+
+####What are the top 5 most frequent arrests in 'pd_desc' in 2022? #####
+arrests_type_2022 <- arrests_2022_clean %>%
+  #group by pd_desc
+  count(pd_desc) %>%
+  #arrange in decreasing count order
+  arrange(desc(n)) %>%
+  #slide to just top 5 most frequent pd_desc
+  slice(1:5) 
+
+#pull the list of the 2022 top causes
+top_2022_list <- arrests_type_2022 %>%
+  pull(pd_desc)
+
+#pull the top 5 2022 causes out of the historic data
+arrests_type_his <- arrests_join %>%
+  filter(pd_desc %in% top_2022_list) %>%
+  #group by pd_desc
+  count(pd_desc, year) %>%
+  #arrange in decreasing count order
+  arrange(desc(n)) 
+
+#factor the top 5 in order to match bar chart
+arrests_type_his <- arrests_type_his %>%
+  mutate(pd_desc=factor(fct_relevel(pd_desc, c("ASSAULT 3", "LARCENY,PETIT FROM OPEN AREAS,","ASSAULT 2,1,UNCLASSIFIED","ROBBERY,OPEN AREA UNCLASSIFIED","PUBLIC ADMINISTATION,UNCLASSI"))))
+
+####If we think of arrests as a sample of total crime, is there more crime in####
+#precinct 19 (Upper East Side) than precinct 73 (Brownsville)? 
+## tally the arrests by precinct
+arrests_precinct <- arrests_join %>%
+  count(arrest_precinct) %>%
+  #filter to just precinct 19 and 73
+  filter(arrest_precinct==19 | arrest_precinct==73)
+
+#Describe the trend, variability and justify any statistical tests used 
+arrests_precinct_year <- arrests_join %>%
+  count(arrest_precinct, year) %>%
+  filter(arrest_precinct==19 | arrest_precinct==73) %>%
+  #make the label include precinct for graph
+  mutate(arrest_precinct2=case_when(arrest_precinct==19~"Precinct 19",
+                                    arrest_precinct==73~"Precinct 73"))
+
+#Include any exploratory data analysis that you feel adds to the analysis.
+#normalize by population
+tract <- get_acs(geography = "tract", 
+                 state="NY",
+                 year=2019,
+                 variables = c(pop = "B01003_001"), geometry = TRUE) %>%
+  select(-moe) %>%
+  spread(variable, estimate) %>%
+  st_transform(4326)
+
+#transform the polygons into points in the centroid of tract
+tract_centroid <- tract %>%
+  st_centroid()
+
+#read in precinct data as sf - using the downloaded geojson bc 
+#it's easier to load as sf rather than the json API version
+precinct <- st_read("Police Precincts.geojson") %>%
+  st_transform(4326)
+
+#spatially join the tracts to their respective precinct
+precinct_tract <- tract_centroid %>%
+  st_join(precinct, join=st_within)
+
+#remove the NAs from the rest of the state, just leave
+#tracts that overlap with precinct shapes
+nyc_precinct_tract <- precinct_tract %>%
+  filter(!is.na(precinct))
+
+#group by precinct and sum the population, remove geometry
+precinct_pop <- nyc_precinct_tract %>%
+  group_by(precinct) %>%
+  summarize(pop=sum(pop, na.rm=T)) %>%
+  st_drop_geometry()
+
+#join the population sums back to the precincts arrests by year
+arrests_precinct_year_NORM <- arrests_precinct_year %>%
+  left_join(precinct_pop, by=c("arrest_precinct"="precinct")) %>%
+  #create a column that is the arrests per 100 residents
+  mutate(arrest_rate=((n/pop)*100),
+         #make label match
+         arrest_precinct2=case_when(arrest_precinct==19~"Precinct 19",
+                                    arrest_precinct==73~"Precinct 73")
+  )
+
+#create choropleth map of arrest counts by precinct
+#create new df with counts of arrests for all precincts/years
+all_precinct_year <- arrests_join %>%
+  count(arrest_precinct, year)
+
+#join those counts to the precinct sf
+arrests_precinct_year_sf <- precinct %>%
+  left_join(all_precinct_year, by=c("precinct"="arrest_precinct"))
+
+```
+###  Question 1 
+#### <b>Has the arrest rate been decreasing from 2018-2022? Describe the trend and defend any statistical tests used to support this conclusion. </b> <br>
+
+Since 2018, the overall arrest count has decreased from nearly 250,000 arrests annually to 155,000 annual arrests in 2021. These are overall arrest counts, rather than arrest rates as a proportion of larger population.
+
+As of June 27, 2022, there were nearly 79,000 arrests in 2022. As of June 27, 2021 there were 73,000 arrests to date, meaning that 2022 arrest counts are roughly on track with the 2021 rate.	
+
+```{r regression plot, tidy=T,include=T,message=F,warning=F, echo=F, cache=T, fig.align="center"}
+#plot of year over year arrests and the regression line
+set_urbn_defaults(style="print")
+ggplot() +
+  geom_line(data=arrests_annual, aes(x = year, y = n), linetype="longdash")+
+  geom_line(data=arrests_annual, aes(x = year, replace(n, n==76831, NA)))+
+  geom_smooth(data=arrests_annual, aes(x=year, y=n), method='glm',linetype="dotted", color="#ec008b")+
+  geom_point(data=arrests_annual, aes(x=year, y=n)) +
+  labs(x="Year",
+       y="Arrest Count")+
+  scale_y_continuous(label = comma)+
+  theme(axis.text.x = element_text(size=12, hjust=0),
+        axis.text.y=element_text(size=12),
+        axis.title=element_text(size=14),
+        legend.text = element_text(size = 12))
+
+```
+According to this regression, every year there is a decrease of on average almost 40,000 arrests. We can be 95% confident that this coefficient estimate (of 39,899) is reliable and according to the R-squared value, 87% of the variation in arrests can be attributed to year over year changes, meaning that there are statistical decreases in crime from 2018 to now.
+<br>
+<center>
+<table style="text-align:center"><caption><strong>Year over Year Arrests</strong></caption>
+<tr><td colspan="2" style="border-bottom: 1px solid black"></td></tr><tr><td style="text-align:left"></td><td><em>Dependent variable:</em></td></tr>
+<tr><td></td><td colspan="1" style="border-bottom: 1px solid black"></td></tr>
+<tr><td style="text-align:left"></td><td>Arrest.Count</td></tr>
+<tr><td colspan="2" style="border-bottom: 1px solid black"></td></tr><tr><td style="text-align:left">Year</td><td>-39,899.400<sup>**</sup></td></tr>
+<tr><td style="text-align:left"></td><td>(7,484.980)</td></tr>
+<tr><td style="text-align:left"></td><td></td></tr>
+<tr><td style="text-align:left">Constant</td><td>80,763,616.000<sup>**</sup></td></tr>
+<tr><td style="text-align:left"></td><td>(15,119,663.000)</td></tr>
+<tr><td style="text-align:left"></td><td></td></tr>
+<tr><td colspan="2" style="border-bottom: 1px solid black"></td></tr><tr><td style="text-align:left">Observations</td><td>5</td></tr>
+<tr><td style="text-align:left">R<sup>2</sup></td><td>0.905</td></tr>
+<tr><td style="text-align:left">Adjusted R<sup>2</sup></td><td>0.873</td></tr>
+<tr><td style="text-align:left">Residual Std. Error</td><td>23,669.580 (df = 3)</td></tr>
+<tr><td style="text-align:left">F Statistic</td><td>28.415<sup>**</sup> (df = 1; 3)</td></tr>
+<tr><td colspan="2" style="border-bottom: 1px solid black"></td></tr><tr><td style="text-align:left"><em>Note:</em></td><td style="text-align:right"><sup>*</sup>p<0.1; <sup>**</sup>p<0.05; <sup>***</sup>p<0.01</td></tr>
+</table>
+</center>
+<br>
+
+Additionally, when we look at geospatial patterns, we can see that between 2018-2021, there were more precincts that fell into the highest quartile of overall arrest counts as compared to 2021, meaning that more precints in 2021 had lower arrest rates as compared to 2018.
+```{r choro_maps,tidy=T,message=F,warning=F, echo=F,cache=T, warning=F, error=F, cache=T,fig.align = 'center'}
+##create multiple minis maps
+set_urbn_defaults(style="map")
+#pull in the code to cut into quartiles
+source("gen_cut_labels.R")
+
+#create a new discrete variable that breaks the range of 
+#all arrests over all years into quartiles
+#this can create a shared legend scale
+arrests_precinct_year_sf <- arrests_precinct_year_sf %>%
+  mutate(arrest_quart=cut_number(n,4)%>%
+                    factor(labels=gen_cut_labels(.,type="count"))
+  )
+
+#create subset plots for every year with same breaks
+choro_18 <- ggplot()+
+  geom_sf(data=subset(arrests_precinct_year_sf, year %in% c(2018)), colour=NA, aes(fill=arrest_quart))+
+  scale_fill_manual(values = c("#a2d4ec",
+                               "#73bfe2","#46abdb","#0a4c6a"))+
+  labs(fill="Arrest Count",
+       title="2018")
+
+choro_19 <- ggplot()+
+  geom_sf(data=subset(arrests_precinct_year_sf, year %in% c(2019)), colour=NA, aes(fill=arrest_quart))+
+  scale_fill_manual(values = c("#a2d4ec",
+                               "#73bfe2","#46abdb","#0a4c6a"))+
+  labs(fill="Arrest Count",
+       title="2019")
+
+choro_20 <- ggplot()+
+  geom_sf(data=subset(arrests_precinct_year_sf, year %in% c(2020)), colour=NA, aes(fill=arrest_quart))+
+  scale_fill_manual(values = c("#a2d4ec",
+                               "#73bfe2","#46abdb","#0a4c6a"))+
+  labs(fill="Arrest Count",
+       title="2020")
+
+choro_21 <- ggplot()+
+    geom_sf(data=subset(arrests_precinct_year_sf, year %in% c(2021)), colour=NA, aes(fill=arrest_quart))+
+  scale_fill_manual(values = c("#a2d4ec",
+                               "#73bfe2","#46abdb","#0a4c6a"))+
+    labs(fill="Arrest Count",
+         title="2021")
+
+#create multiple minis with shared legend
+multiple_mini <- ((choro_18 | choro_19)/
+  (choro_20| choro_21))+plot_layout(guides = "collect")
+multiple_mini
+```
+
+
+### Question 2 
+#### <b>What are the top 5 most frequent arrests as described in the column 'pd_desc' in 2022? Compare & describe the overall trends of these arrests across time. </b> <br>
+
+```{r pd_desc_table,cache=T, warning=F, error=F, echo=F, fig.align = 'center'}
+pd_table <- arrests_type_2022 %>%
+  gt() %>%
+  fmt_number(n,
+             decimals=0) %>%
+  tab_header(title="Top 5 Arrests in 2022") %>%
+  cols_label(pd_desc = "Arrest Description",
+             n = "Count") 
+pd_table
+
+```
+<br>
+
+These five arrest causes have not consistently been the most common causes for arrest. Four out of five of the most common arrests have decreased from 2018-2022, mirroring the overall arrest trend. 
+
+Robbery, larceny, and public administration offenses were virtually not recorded in 2018 and appeared in the data in 2019 as some of the top arrest causes. For example, public administration arrests went from two arrests in 2018 to 7,795 arrests in 2019. This could signal that the arrest categorizations were reorganized in 2019 and it would be worth trying to reorganize arrest causes into larger categorical buckets with someone who has more domain knowledge.
+
+``` {r pd_desc_hist, cache=T, warning=F, error=F, echo=F, fig.align = 'center'}
+set_urbn_defaults(style="print")
+ggplot(arrests_type_his, aes(x = year, y = n, color=pd_desc)) +
+  geom_point() +
+  geom_line()+
+  labs(x="Year",
+       y="Arrest Count",
+       color="Arrest Charge")+
+  scale_y_continuous(label = comma)+
+  theme(axis.text.x = element_text(size=12, hjust=0),
+        axis.text.y=element_text(size=12),
+        axis.title=element_text(size=14),
+        legend.text = element_text(size = 10),
+        legend.direction='vertical',
+        legend.title = element_text(size=12),
+        legend.position='top')
+```
+
+
+### Question 3
+#### <b>If we think of arrests as a sample of total crime, is there more crime in precinct 19 (Upper East Side) than precinct 73 (Brownsville)? Describe the trend, variability, and justify any statistical tests used to support this conclusion. </b> <br>
+
+From 2018 to 2022, Precinct 73 saw consistently higher arrest counts than Precinct 19. In 2018, Precinct 73 saw 124% more arrests than Precinct 19. Arrest counts have decreased in both precincts since 2018, but the difference in arrests between precincts has also narrowed. To date in 2022, Precinct 73 has seen just 80% more arrests than Precinct 19.
+Precinct 73 has higher variance than Precinct 19. This makes sense because Precinct 73 saw higher arrest rates to begin with and saw a greater proportional drop in arrests compared to Precinct 19. 
+
+```{r precinct, echo=F, error=F, fig.align='center', message=FALSE, warning=FALSE, cache=T, tidy=T}
+#year over year by precinct
+set_urbn_defaults(style="print")
+ggplot(arrests_precinct_year, aes(x = year, y = n, color=arrest_precinct2)) +
+  geom_point() +
+  geom_line()+
+  geom_smooth(method='lm',linetype="dotted")+
+  labs(x="Year",
+       y="Arrest Count",
+       color="")+
+  scale_y_continuous(label = comma)+
+  theme(axis.text.x = element_text(size=12, hjust=0),
+        axis.text.y=element_text(size=12),
+        axis.title=element_text(size=14),
+        legend.text = element_text(size = 10))
+```
+When we normalize these arrest counts for the approximate population of each precinct (according to American Community Survey, 2015-2019 data), the disparities between precincts become even more stark. In Precinct 19 in 2018, there were 1.2 arrests per 100 residents, whereas in Precinct 73 in 2018, there were 6.4 arrests per 100 residents. By 2022, this had decreased to 0.8 per 100 people in Precinct 19 and 3.0 per 100 people in Precinct 73.
+``` {r prec_normalized,tidy=T,message=F,warning=F, echo=F,cache=T, error=F,fig.align = 'center'}
+#year over year by precinct normalized
+set_urbn_defaults(style="print")
+ggplot(arrests_precinct_year_NORM, aes(x = year, y = arrest_rate, color=arrest_precinct2)) +
+  geom_point() +
+  geom_line()+
+  geom_smooth(method='lm',linetype="dotted")+
+  labs(x="Year",
+       y="Arrests per 100 Residents",
+       color="Precinct",
+       caption="Source: American Community Survey, 2015-2019")+
+  theme(axis.text.x = element_text(size=12, hjust=0),
+        axis.text.y=element_text(size=12),
+        axis.title=element_text(size=14),
+        legend.text = element_text(size = 10))
+```
+
+### Question 4
+
+#### <b>Given the available data, what model would you build to predict crime to better allocate NYPD resources? What challenges do you foresee? Describe how you chose your independent and dependent variables. How would you evaluate the model? Discuss in no more than 150 words. </b> <br>
+
+I would build a forward stepwise model that uses violent felonies as the dependent model and pulls from independent variables not only on past arrests or demographics but also from data that includes information on infrastructure and assets, things like [311 Services](https://data.cityofnewyork.us/Social-Services/311-Service-Requests-from-2010-to-Present/erm2-nwe9 "311 Services") calls for out streetlights, or information on public resources. 
+
+The reason for including this data being that I think the biggest challenge is creating a model that does not build upon racial biases and that does not reinforce punitive and racist [models](https://www.propublica.org/article/machine-bias-risk-assessments-in-criminal-sentencing "models").
+Building an anti-racist model means going beyond not solely including race as a factor, but also examining any multicolinear variables like poverty, which are strongly correlated with race and seeking to not just target policing to low-income and BIPOC communities that already struggle with crime, but also providing those communities with much needed resources and focusing on the crime that is the highest priority rather than low-level offenses.
+<br><br>
+
+### Reference Code
+```{r full code2, eval=F, tidy=T,message=F,warning=F, echo=T, cache=T, include=T}
+#load in libraries
+library(tidyverse)
+library(tidylog)
+library(tidycensus)
+library(RSocrata)
+library(sf)
+library(urbnthemes)
+library(ggplot2)
+library(patchwork)
+library(stargazer)
+library(scales)
+library(gt)
+library(gganimate)
+library(transformr)
+library(gifski)
+
+#### Load in data ####
+#2022 YTD data
+arrests_2022 <- read.socrata('https://data.cityofnewyork.us/resource/uip8-fykc.json')
+
+#historic from 2018 onwards
+arrests_hist <- read.socrata('https://data.cityofnewyork.us/resource/8h9b-rp9u.json?$where=arrest_date%3E%272017-12-31%27')
+
+#clean 2022 to only include vars of interest
+arrests_2022_clean <- arrests_2022 %>%
+  select(arrest_key, arrest_date, pd_desc,
+         ofns_desc, law_code,law_cat_cd,
+         arrest_boro, arrest_precinct,
+         age_group, perp_sex, perp_race,
+         latitude, longitude
+  )
+
+#clean 2022 and historic data together
+arrests_join <- arrests_hist %>%
+  #clean historic vars to match 2022 clean vars
+  select(arrest_key, arrest_date, pd_desc,
+         ofns_desc, law_code,law_cat_cd,
+         arrest_boro, arrest_precinct,
+         age_group, perp_sex, perp_race,
+         latitude, longitude
+  ) %>%
+  #tack on 2022 clean with matching columns
+  rbind(arrests_2022_clean) %>%
+  #create year column
+  mutate(year=as.numeric(substring(arrest_date, 1,4)))
+
+#####Group arrests by year
+arrests_annual <- arrests_join %>%
+  count(year)
+
+#Calculate arrests Jan 1-June 27, 2021
+YTD_2021 <- arrests_join %>%
+  filter(arrest_date>="2021-01-01" & arrest_date<="2021-06-27")
+
+#GLM - regression/R2 tests - format for table
+arrests_annual_format <- arrests_annual %>%
+  mutate(Arrest.Count=n,
+         Year=year) %>%
+  select(Year, Arrest.Count)
+annual_regression <-lm(Arrest.Count~Year, data = arrests_annual_format) 
+#stargazer(annual_regression, type = "html",  
+#          title = "Year over Year Arrests")
+#export html markdown to markdown
+
+####What are the top 5 most frequent arrests in 'pd_desc' in 2022? #####
+arrests_type_2022 <- arrests_2022_clean %>%
+  #group by pd_desc
+  count(pd_desc) %>%
+  #arrange in decreasing count order
+  arrange(desc(n)) %>%
+  #slide to just top 5 most frequent pd_desc
+  slice(1:5) 
+
+#pull the list of the 2022 top causes
+top_2022_list <- arrests_type_2022 %>%
+  pull(pd_desc)
+
+#pull the top 5 2022 causes out of the historic data
+arrests_type_his <- arrests_join %>%
+  filter(pd_desc %in% top_2022_list) %>%
+  #group by pd_desc
+  count(pd_desc, year) %>%
+  #arrange in decreasing count order
+  arrange(desc(n)) 
+
+#factor the top 5 in order to match bar chart
+arrests_type_his <- arrests_type_his %>%
+  mutate(pd_desc=factor(fct_relevel(pd_desc, c("ASSAULT 3", "LARCENY,PETIT FROM OPEN AREAS,","ASSAULT 2,1,UNCLASSIFIED","ROBBERY,OPEN AREA UNCLASSIFIED","PUBLIC ADMINISTATION,UNCLASSI"))))
+
+####If we think of arrests as a sample of total crime, is there more crime in####
+#precinct 19 (Upper East Side) than precinct 73 (Brownsville)? 
+## tally the arrests by precinct
+arrests_precinct <- arrests_join %>%
+  count(arrest_precinct) %>%
+  #filter to just precinct 19 and 73
+  filter(arrest_precinct==19 | arrest_precinct==73)
+
+#Describe the trend, variability and justify any statistical tests used 
+arrests_precinct_year <- arrests_join %>%
+  count(arrest_precinct, year) %>%
+  filter(arrest_precinct==19 | arrest_precinct==73) %>%
+  #make the label include precinct for graph
+  mutate(arrest_precinct2=case_when(arrest_precinct==19~"Precinct 19",
+                                    arrest_precinct==73~"Precinct 73"))
+
+#Include any exploratory data analysis that you feel adds to the analysis.
+#normalize by population
+tract <- get_acs(geography = "tract", 
+                 state="NY",
+                 year=2019,
+                 variables = c(pop = "B01003_001"), geometry = TRUE) %>%
+  select(-moe) %>%
+  spread(variable, estimate) %>%
+  st_transform(4326)
+
+#transform the polygons into points in the centroid of tract
+tract_centroid <- tract %>%
+  st_centroid()
+
+#read in precinct data as sf - using the downloaded geojson bc 
+#it's easier to load as sf rather than the json API version
+precinct <- st_read("Police Precincts.geojson") %>%
+  st_transform(4326)
+
+#spatially join the tracts to their respective precinct
+precinct_tract <- tract_centroid %>%
+  st_join(precinct, join=st_within)
+
+#remove the NAs from the rest of the state, just leave
+#tracts that overlap with precinct shapes
+nyc_precinct_tract <- precinct_tract %>%
+  filter(!is.na(precinct))
+
+#group by precinct and sum the population, remove geometry
+precinct_pop <- nyc_precinct_tract %>%
+  group_by(precinct) %>%
+  summarize(pop=sum(pop, na.rm=T)) %>%
+  st_drop_geometry()
+
+#join the population sums back to the precincts arrests by year
+arrests_precinct_year_NORM <- arrests_precinct_year %>%
+  left_join(precinct_pop, by=c("arrest_precinct"="precinct")) %>%
+  #create a column that is the arrests per 100 residents
+  mutate(arrest_rate=((n/pop)*100),
+         #make label match
+         arrest_precinct2=case_when(arrest_precinct==19~"Precinct 19",
+                                    arrest_precinct==73~"Precinct 73")
+  )
+
+#create choropleth map of arrest counts by precinct
+#create new df with counts of arrests for all precincts/years
+all_precinct_year <- arrests_join %>%
+  count(arrest_precinct, year)
+
+#join those counts to the precinct sf
+arrests_precinct_year_sf <- precinct %>%
+  left_join(all_precinct_year, by=c("precinct"="arrest_precinct"))
+
+```
